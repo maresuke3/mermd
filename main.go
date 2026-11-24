@@ -185,16 +185,32 @@ func hasStdinPipe() bool {
 }
 
 func openBrowser(url string) error {
-	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "linux":
-		cmd = exec.Command("xdg-open", url)
+		candidates := [][]string{
+			{"xdg-open", url},
+			{"wslview", url},
+			{"rundll32.exe", "url.dll,FileProtocolHandler", url},
+			{"/mnt/c/WINDOWS/system32/rundll32.exe", "url.dll,FileProtocolHandler", url},
+			{"cmd.exe", "/c", "start", "", url},
+			{"explorer.exe", url},
+		}
+		for _, args := range candidates {
+			bin, err := exec.LookPath(args[0])
+			if err != nil {
+				continue
+			}
+			cmd := exec.Command(bin, args[1:]...)
+			if err := cmd.Start(); err == nil {
+				return nil
+			}
+		}
+		return errors.New("no browser opener found (tried xdg-open, wslview, rundll32.exe, cmd.exe, explorer.exe)")
 	case "darwin":
-		cmd = exec.Command("open", url)
+		return exec.Command("open", url).Start()
 	case "windows":
-		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
 	default:
 		return fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 	}
-	return cmd.Start()
 }

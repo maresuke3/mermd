@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"image"
 	"image/draw"
-	_ "image/png"
+	"image/png"
 	"io"
 	"math"
 	"os"
@@ -187,7 +187,14 @@ func newGlamourRenderer(style string, width int) (*glamour.TermRenderer, error) 
 	)
 }
 
-func renderMermaidToTerminal(w io.Writer, diagram string, width int, opts TerminalOptions, _ *glamour.TermRenderer) error {
+func renderMermaidToTerminal(w io.Writer, diagram string, width int, opts TerminalOptions, renderer *glamour.TermRenderer) error {
+	imgFormat := resolveImageFormat(opts.ImageFormat)
+	if imgFormat == "unsupported-herdr" {
+		fallback, _ := renderer.Render("```mermaid\n" + diagram + "\n```")
+		_, err := fmt.Fprintf(w, "\n[mermd: terminal image display is unavailable inside herdr; use `mermd -w` for browser preview or run directly in WezTerm]\n%s", fallback)
+		return err
+	}
+
 	mmdcPath, err := exec.LookPath("mmdc")
 	if err != nil {
 		return fmt.Errorf("mmdc not found in PATH")
@@ -244,9 +251,7 @@ func renderMermaidToTerminal(w io.Writer, diagram string, width int, opts Termin
 		maxCols = 40
 	}
 
-	imgFormat := resolveImageFormat(opts.ImageFormat)
-
-	// Send lossless RGBA pixels directly for Kitty and PNG for iTerm2 so there is no downsampling blur.
+	// Send lossless pixels/PNG directly for iTerm2 and Kitty protocols so there is no downsampling blur.
 	if imgFormat == "kitty" {
 		pngData, err := os.ReadFile(outFile)
 		if err != nil {
@@ -334,19 +339,28 @@ func WriteKittyImage(w io.Writer, pngData []byte, maxCols int) error {
 	encoded := base64.StdEncoding.EncodeToString(rgba.Pix)
 	const chunkSize = 4096
 
-	if _, err := fmt.Fprintf(w, "\n\x1b_Ga=T,f=32,s=%d,v=%d,c=%d,r=%d,m=1,q=2\x1b\\", pw, ph, cols, rows); err != nil {
+	if _, err := fmt.Fprint(w, "\r\n"); err != nil {
 		return err
 	}
 	for i := 0; i < len(encoded); i += chunkSize {
 		end := i + chunkSize
-		if end > len(encoded) {
+		more := 1
+		if end >= len(encoded) {
 			end = len(encoded)
+			more = 0
 		}
-		if _, err := fmt.Fprintf(w, "\x1b_Gm=1;%s\x1b\\", encoded[i:end]); err != nil {
-			return err
+		chunk := encoded[i:end]
+		if i == 0 {
+			if _, err := fmt.Fprintf(w, "\x1b_Ga=T,f=32,s=%d,v=%d,c=%d,r=%d,m=%d,q=2;%s\x1b\\", pw, ph, cols, rows, more, chunk); err != nil {
+				return err
+			}
+		} else {
+			if _, err := fmt.Fprintf(w, "\x1b_Gm=%d;%s\x1b\\", more, chunk); err != nil {
+				return err
+			}
 		}
 	}
-	_, err = fmt.Fprint(w, "\x1b_Gm=0\x1b\\\n\n")
+	_, err = fmt.Fprint(w, strings.Repeat("\r\n", rows+1))
 	return err
 }
 
@@ -397,8 +411,43 @@ func writeKittyImage(w io.Writer, pngData []byte, cols int) error {
 }
 
 func writeITermImage(w io.Writer, pngData []byte, cols int) error {
-	encoded := base64.StdEncoding.EncodeToString(pngData)
-	_, err := fmt.Fprintf(w, "\n\x1b]1337;File=inline=1;width=%d;preserveAspectRatio=1:%s\a\n\n", cols, encoded)
+	img, _, err := image.Decode(bytes.NewReader(pngData))
+	if err != nil {
+		return fmt.Errorf("decode png: %w", err)
+	}
+	bounds := img.Bounds()
+	pw, ph := bounds.Dx(), bounds.Dy()
+	if pw <= 0 || ph <= 0 {
+		return fmt.Errorf("invalid image dimensions: %dx%d", pw, ph)
+	}
+
+	const maxPixelWidth = 1000
+	finalPNG := pngData
+	if pw > maxPixelWidth {
+		newW := maxPixelWidth
+		newH := int(math.Round(float64(ph) * float64(newW) / float64(pw)))
+		if newH < 1 {
+			newH = 1
+		}
+		resized := resizeBilinear(img, newW, newH)
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, resized); err != nil {
+			return err
+		}
+		finalPNG = buf.Bytes()
+		pw, ph = newW, newH
+	}
+
+	if cols <= 0 {
+		cols = 80
+	}
+	rows := int(math.Ceil(float64(ph) * float64(cols) / (float64(pw) * 2.0)))
+	if rows < 1 {
+		rows = 1
+	}
+
+	encoded := base64.StdEncoding.EncodeToString(finalPNG)
+	_, err = fmt.Fprintf(w, "\r\n\x1b]1337;File=inline=1;width=%d;preserveAspectRatio=1:%s\a%s", cols, encoded, strings.Repeat("\r\n", rows+1))
 	return err
 }
 
@@ -406,11 +455,15 @@ func resolveImageFormat(requested string) string {
 	if requested != "" && requested != "auto" {
 		return requested
 	}
-	if os.Getenv("KITTY_WINDOW_ID") != "" ||
-		os.Getenv("WEZTERM_PANE") != "" ||
-		os.Getenv("GHOSTTY_RESOURCES_DIR") != "" ||
-		os.Getenv("HERDR_ENV") != "" ||
-		strings.EqualFold(os.Getenv("TERM_PROGRAM"), "herdr") {
+	if os.Getenv("HERDR_ENV") != "" || strings.EqualFold(os.Getenv("TERM_PROGRAM"), "herdr") {
+		return "unsupported-herdr"
+	}
+	if os.Getenv("WEZTERM_PANE") != "" ||
+		strings.EqualFold(os.Getenv("TERM_PROGRAM"), "wezterm") ||
+		strings.EqualFold(os.Getenv("TERM_PROGRAM"), "conductty") {
+		return "iterm"
+	}
+	if os.Getenv("KITTY_WINDOW_ID") != "" || os.Getenv("GHOSTTY_RESOURCES_DIR") != "" {
 		return "kitty"
 	}
 	if strings.Contains(strings.ToLower(os.Getenv("TERM_PROGRAM")), "iterm") {

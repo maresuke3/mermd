@@ -83,10 +83,10 @@ func TestWriteKittyImage(t *testing.T) {
 		t.Fatalf("WriteKittyImage failed: %v", err)
 	}
 	got := out.String()
-	if !strings.Contains(got, "\x1b_Ga=T,f=32,s=100,v=50,c=80,r=20,m=1,q=2\x1b\\") {
+	if !strings.Contains(got, "\x1b_Ga=T,f=32,s=100,v=50,c=80,r=20,m=1,q=2;") {
 		t.Errorf("unexpected kitty header in output: %q", got[:min(len(got), 120)])
 	}
-	if !strings.Contains(got, "\x1b_Gm=0\x1b\\") {
+	if !strings.Contains(got, "\x1b_Gm=0;") {
 		t.Errorf("missing terminating kitty chunk")
 	}
 }
